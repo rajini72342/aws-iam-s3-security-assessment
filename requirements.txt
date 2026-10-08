@@ -1,0 +1,4 @@
+boto3>=1.34
+checkov>=3.2
+# Prowler is heavy; install it separately so it cannot conflict:
+#   pipx install prowler

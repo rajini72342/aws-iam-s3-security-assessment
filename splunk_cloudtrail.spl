@@ -1,0 +1,68 @@
+/* =============================================================================
+   Splunk SPL detections for AWS IAM / S3 misconfiguration abuse
+   Data: CloudTrail JSON Lines produced by scripts/export_cloudtrail.py
+   Load: Splunk (Free/Enterprise trial) > Settings > Add Data > Upload,
+         sourcetype = _json, index = aws_lab
+   Production note: with the Splunk Add-on for AWS use sourcetype=aws:cloudtrail.
+   ============================================================================= */
+
+
+/* ---- 1. S3 bucket made public / protections removed (T1530) ---------------- */
+index=aws_lab sourcetype=_json eventSource="s3.amazonaws.com"
+  eventName IN ("PutBucketPolicy","PutBucketAcl","DeleteBucketPolicy",
+                "PutBucketPublicAccessBlock","DeleteBucketPublicAccessBlock")
+  NOT errorCode=*
+| table _time, userIdentity.arn, eventName, requestParameters.bucketName, sourceIPAddress, userAgent
+| sort - _time
+
+
+/* ---- 2. Console login without MFA (T1078.004) ------------------------------ */
+index=aws_lab sourcetype=_json eventName=ConsoleLogin responseElements.ConsoleLogin=Success
+  additionalEventData.MFAUsed=No
+| table _time, userIdentity.arn, sourceIPAddress, userAgent
+
+
+/* ---- 3. AdministratorAccess attached (T1098) -------------------------------- */
+index=aws_lab sourcetype=_json
+  eventName IN ("AttachUserPolicy","AttachRolePolicy","AttachGroupPolicy") NOT errorCode=*
+| where like('requestParameters.policyArn', "%/AdministratorAccess")
+| table _time, userIdentity.arn, eventName, requestParameters.userName, requestParameters.roleName,
+        requestParameters.policyArn, sourceIPAddress
+
+
+/* ---- 4. Inline policy / policy version changes (T1098) --------------------- */
+index=aws_lab sourcetype=_json
+  eventName IN ("PutUserPolicy","PutRolePolicy","PutGroupPolicy","CreatePolicyVersion","SetDefaultPolicyVersion")
+  NOT errorCode=*
+| table _time, userIdentity.arn, eventName, requestParameters.policyName, sourceIPAddress
+
+
+/* ---- 5. Access key created for someone else, or by root (T1098.001) -------- */
+index=aws_lab sourcetype=_json eventName=CreateAccessKey NOT errorCode=*
+| eval actor=mvindex(split('userIdentity.arn', "/"), -1)
+| eval target=coalesce('requestParameters.userName', actor)
+| where actor!=target OR 'userIdentity.type'="Root"
+| table _time, actor, target, sourceIPAddress, userAgent
+
+
+/* ---- 6. CloudTrail tampering (T1562.008) ------------------------------------ */
+index=aws_lab sourcetype=_json eventSource="cloudtrail.amazonaws.com"
+  eventName IN ("StopLogging","DeleteTrail","UpdateTrail","PutEventSelectors")
+| table _time, userIdentity.arn, eventName, requestParameters.name, sourceIPAddress
+
+
+/* ---- 7. Root account usage (T1078.004) -------------------------------------- */
+index=aws_lab sourcetype=_json userIdentity.type=Root NOT eventType=AwsServiceEvent
+| stats count min(_time) as first_seen max(_time) as last_seen values(eventName) as actions by sourceIPAddress
+| convert ctime(first_seen) ctime(last_seen)
+
+
+/* ---- 8. Role trust policy modified (T1098) ---------------------------------- */
+index=aws_lab sourcetype=_json eventName=UpdateAssumeRolePolicy NOT errorCode=*
+| table _time, userIdentity.arn, requestParameters.roleName, requestParameters.policyDocument, sourceIPAddress
+
+
+/* ---- BONUS: triage pivot - everything one identity did in the last 24h ------ */
+index=aws_lab sourcetype=_json userIdentity.arn="*dev-wildcard*" earliest=-24h
+| stats count by eventName, eventSource
+| sort - count
